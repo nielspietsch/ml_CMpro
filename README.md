@@ -8,3 +8,7 @@ Basic structure:
   3) Annotation of nuclei and feature generation for machine learning (napari) Nuclei are classified by PCM1+/- for cardiomyocyte discrimination and EdU +/- for DNA synthesis detection.
   4) Training of random forest algorithm and cross-validation.
   5) Analysis of images with pre-trained model (CPU).
+
+Script 1: Z-stack generation and nuclear segmentation ().
+Script 2: Training of machine learning algorithm for classification of nuclei into cardiomyocyte or non-myocyte nuclei and EdU +/-.
+Script 3: Batch analysis of images for proliferating cardiomyocyte nuclei.
