@@ -10,5 +10,7 @@ Basic structure:
   5) Analysis of images with pre-trained model (CPU).
 
 Script 1: Z-stack generation and nuclear segmentation ().
+
 Script 2: Training of machine learning algorithm for classification of nuclei into cardiomyocyte or non-myocyte nuclei and EdU +/-.
+
 Script 3: Batch analysis of images for proliferating cardiomyocyte nuclei.
