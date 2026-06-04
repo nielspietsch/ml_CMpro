@@ -1,0 +1,64 @@
+import os
+import numpy as np
+import tifffile as tiff
+import matplotlib.pyplot as plt
+from glob import glob
+import tensorflow as tf
+from csbdeep.utils import normalize
+from stardist.models import StarDist2D
+from stardist.plot import render_label
+
+# ── GPU setup ─────────────────────────────────────────────────────────────────
+print(f"TensorFlow version: {tf.__version__}")
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    for gpu in gpus:
+        tf.config.experimental.set_memory_growth(gpu, True)
+    print(f"✅ GPU detected: {[g.name for g in gpus]}")
+else:
+    print("⚠️  No GPU detected — running on CPU")
+
+# ── Load model (once) ─────────────────────────────────────────────────────────
+model = StarDist2D.from_pretrained('2D_versatile_fluo')
+print("✅ StarDist model loaded")
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+input_folder  = "/mnt/c/Users/Niels/MIP output"
+output_folder = "/mnt/c/Users/Niels/Labels"
+os.makedirs(output_folder, exist_ok=True)
+
+files = glob(os.path.join(input_folder, "*_MIP.tif"))
+print(f"Found {len(files)} MIP files")
+
+PREVIEW = False  # set True for visual inspection during testing
+
+# ── Segmentation loop ─────────────────────────────────────────────────────────
+for f in files:
+    print(f"Segmenting: {os.path.basename(f)}")
+
+    # Load MIP and extract DAPI (channel 0)
+    img  = tiff.imread(f)
+    dapi = img[0].astype(np.float32)
+
+    # Normalize and predict on GPU
+    labels, details = model.predict_instances(normalize(dapi))
+
+    # Optional preview
+    if PREVIEW:
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+        axes[0].imshow(dapi, cmap='gray')
+        axes[0].set_title("DAPI")
+        axes[0].axis('off')
+        axes[1].imshow(render_label(labels, img=dapi))
+        axes[1].set_title(f"Segmented nuclei (n={labels.max()})")
+        axes[1].axis('off')
+        plt.tight_layout()
+        plt.show()
+
+    # Save label map for downstream PCM1/EdU analysis
+    out_name = os.path.basename(f).replace("_MIP.tif", "_labels.tif")
+    out_path = os.path.join(output_folder, out_name)
+    tiff.imwrite(out_path, labels.astype(np.int32))
+    print(f"  → {labels.max()} nuclei detected, saved to {out_name}")
+
+print("✅ Segmentation complete.")
