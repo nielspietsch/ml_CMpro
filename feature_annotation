@@ -1,0 +1,137 @@
+#Script for feature annotation recognition 
+
+import os
+import numpy as np
+import pandas as pd
+import tifffile as tiff
+from glob import glob
+from scipy.ndimage import binary_dilation
+from skimage.measure import regionprops
+from joblib import Parallel, delayed
+
+
+# ── Paths ──────────────────────────────────────────────────────────────────────
+ann_root      = "/home/niels/MIP_output/training dataset"   # folder containing per-image subfolders
+output_folder = "/home/niels/Model"
+os.makedirs(output_folder, exist_ok=True)
+
+CH_DAPI  = 0
+CH_EDU   = 1
+CH_PCM1  = 2
+DILATION = 5   # px for PCM1 ring zone
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def extract_features(nid, nucleus_mask, ring_mask, dapi, edu, pcm1):
+    edu_vals       = edu [nucleus_mask]
+    pcm1_ring_vals = pcm1[ring_mask] if ring_mask.any() else np.array([0.0])
+    pcm1_nuc_vals  = pcm1[nucleus_mask]
+    dapi_vals      = dapi[nucleus_mask]
+    rp             = regionprops(nucleus_mask.astype(np.uint8))[0]
+
+    return {
+        "edu_mean":               edu_vals.mean(),
+        "edu_median":             np.median(edu_vals),
+        "edu_std":                edu_vals.std(),
+        "edu_max":                edu_vals.max(),
+        "edu_p95":                np.percentile(edu_vals, 95),
+        "pcm1_ring_mean":         pcm1_ring_vals.mean(),
+        "pcm1_ring_median":       np.median(pcm1_ring_vals),
+        "pcm1_ring_std":          pcm1_ring_vals.std(),
+        "pcm1_ring_max":          pcm1_ring_vals.max(),
+        "pcm1_ring_p95":          np.percentile(pcm1_ring_vals, 95),
+        "pcm1_nuc_mean":          pcm1_nuc_vals.mean(),
+        "pcm1_ring_to_nuc_ratio": pcm1_ring_vals.mean() / (pcm1_nuc_vals.mean() + 1e-9),
+        "dapi_mean":              dapi_vals.mean(),
+        "dapi_std":               dapi_vals.std(),
+        "area":                   rp.area,
+        "eccentricity":           rp.eccentricity,
+    }
+
+# ── Parse annotations ──────────────────────────────────────────────────────────
+subfolders = sorted([
+    d for d in glob(os.path.join(ann_root, "*"))
+    if os.path.isdir(d)
+])
+print(f"Found {len(subfolders)} annotation folders\n")
+
+all_rows = []
+
+for folder in subfolders:
+    name = os.path.basename(folder)
+
+    mip_path   = os.path.join(folder, "image_MIP.tif")
+    label_path = os.path.join(folder, "stardist_labels.tif")
+    pcm1_ann   = os.path.join(folder, "PCM1_Labels.tif")
+    edu_ann    = os.path.join(folder, "EdU_Labels.tif")
+
+    # Validate
+    missing = [p for p in [mip_path, label_path, pcm1_ann, edu_ann]
+               if not os.path.exists(p)]
+    if missing:
+        print(f"⚠️  {name}: missing {[os.path.basename(m) for m in missing]}, skipping.")
+        continue
+
+    print(f"Processing: {name}")
+
+    mip        = tiff.imread(mip_path).astype(np.float32)   # (3, Y, X)
+    labels     = tiff.imread(label_path)                     # (Y, X) int32
+    pcm1_mask  = tiff.imread(pcm1_ann)                       # (Y, X) any dtype
+    edu_mask   = tiff.imread(edu_ann)                       # (Y, X) any dtype
+
+    # Napari saves annotation TIFs as (3, Y, X) — collapse to 2D
+    if pcm1_mask.ndim == 3:
+        pcm1_mask = pcm1_mask.max(axis=0)
+    if edu_mask.ndim == 3:
+        edu_mask = edu_mask.max(axis=0)
+
+    dapi = mip[CH_DAPI];  edu = mip[CH_EDU];  pcm1 = mip[CH_PCM1]
+
+    # ── Compute all ring masks in one global dilation ──────────────────────
+    struct        = np.ones((2 * DILATION + 1, 2 * DILATION + 1), dtype=bool)
+    labels_binary = labels > 0
+    dilated_all   = binary_dilation(labels_binary, structure=struct)
+    ring_all      = dilated_all & ~labels_binary
+
+    from scipy.ndimage import grey_dilation
+    dilated_labels = grey_dilation(labels, size=(2 * DILATION + 1, 2 * DILATION + 1))
+    ring_label_map = np.where(ring_all, dilated_labels, 0)
+
+    nucleus_ids = np.unique(labels)
+    nucleus_ids = nucleus_ids[nucleus_ids > 0]
+
+    def process_nucleus(nid):
+        nucleus_mask = labels == nid
+        ring_mask    = ring_label_map == nid
+        feats = extract_features(nid, nucleus_mask, ring_mask, dapi, edu, pcm1)
+        yx    = np.argwhere(nucleus_mask).mean(axis=0)
+        feats.update({"label": nid, "centroid_y": yx[0], "centroid_x": yx[1]})
+        is_pcm1 = bool((pcm1_mask[nucleus_mask] > 0).any())
+        is_edu  = bool((edu_mask [nucleus_mask] > 0).any())
+        if is_edu and is_pcm1:
+            feats["class"] = 3
+        elif is_edu:
+            feats["class"] = 1
+        elif is_pcm1:
+            feats["class"] = 2
+        else:
+            feats["class"] = 0
+        feats["image"] = name
+        return feats
+
+    rows = Parallel(n_jobs=-1)(delayed(process_nucleus)(nid) for nid in nucleus_ids)
+    df_img = pd.DataFrame(rows)
+    all_rows.extend(rows)
+
+    counts = df_img["class"].value_counts()
+    print(f"  {len(nucleus_ids)} nuclei — "
+          f"negative: {counts.get(0,0)}  EdU+: {counts.get(1,0)}  "
+          f"PCM1+: {counts.get(2,0)}  double+: {counts.get(3,0)}")
+
+# ── Save feature table ─────────────────────────────────────────────────────────
+df = pd.DataFrame(all_rows)
+feat_path = os.path.join(output_folder, "features.csv")
+df.to_csv(feat_path, index=False)
+print(f"\nTotal nuclei: {len(df)}")
+print(df["class"].value_counts().sort_index().rename({0:"negative",1:"EdU+",2:"PCM1+",3:"double+"}))
+print(f"✅ Features saved to {feat_path}")
