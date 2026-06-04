@@ -1,0 +1,68 @@
+from aicspylibczi import CziFile
+import numpy as np
+import tifffile as tiff
+import os
+from glob import glob
+import matplotlib.pyplot as plt
+
+# ── Paths ──────────────────────────────────────────────────────────────────────
+input_folder  = "/mnt/c/Users/Nikon/Niels/EdU incorporation EHTs/WT 25.1"
+output_folder = "/home/niels/MIP_output"
+os.makedirs(output_folder, exist_ok=True)
+
+# ── Channel mapping ────────────────────────────────────────────────────────────
+CH_ACTN2 = 0   # discarded
+CH_EDU   = 1
+CH_DAPI  = 2
+CH_PCM1  = 3
+EXPECTED_CHANNELS = 4
+
+TITLES  = ["DAPI", "EdU", "PCM1"]
+PREVIEW = True  # set True for visual inspection during testing
+
+# ── Process ───────────────────────────────────────────────────────────────────
+files = glob(os.path.join(input_folder, "**", "*.czi"), recursive=True)
+print(f"Found {len(files)} CZI files")
+
+for f in files:
+    print(f"Processing: {os.path.basename(f)}")
+
+    # Load
+    czi = CziFile(f)
+    img, _ = czi.read_image()
+    img = np.squeeze(img)  # (C, Z, Y, X)
+
+    # Validate shape
+    assert img.ndim == 4, \
+        f"Unexpected ndim={img.ndim} in {f}"
+    assert img.shape[0] >= EXPECTED_CHANNELS, \
+        f"Expected {EXPECTED_CHANNELS} channels, got {img.shape[0]} in {f}"
+
+    # MIP along Z axis
+    mip = np.max(img, axis=1)  # (C, Y, X)
+
+    # Extract channels in standard order: [DAPI, EdU, PCM1]
+    dapi = mip[CH_DAPI]
+    edu  = mip[CH_EDU]
+    pcm1 = mip[CH_PCM1]
+    final = np.stack([dapi, edu, pcm1], axis=0)  # (3, Y, X)
+
+    # Optional preview
+    if PREVIEW:
+        fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+        for ax, ch, title in zip(axes, final, TITLES):
+            ax.imshow(ch, cmap='gray')
+            ax.set_title(title)
+            ax.axis('off')
+        plt.tight_layout()
+        plt.show()
+
+    # Save as uint16
+    rel_path    = os.path.relpath(f, input_folder)
+    out_name    = rel_path.replace(".czi", "_MIP.tif")
+    output_path = os.path.join(output_folder, out_name)
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    tiff.imwrite(output_path, final.astype(np.uint16))
+    print(f"  → Saved to {filename}")
+
+print("✅ MIP generation complete.")
