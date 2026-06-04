@@ -1,0 +1,78 @@
+#Script for random forest training
+
+import os
+import numpy as np
+import pandas as pd
+import joblib
+import matplotlib.pyplot as plt
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import StratifiedKFold, cross_val_score
+from sklearn.utils.class_weight import compute_class_weight
+from sklearn.metrics import classification_report, ConfusionMatrixDisplay
+
+# ── Paths ──────────────────────────────────────────────────────────────────────
+model_folder = "/home/niels/Model"
+
+df = pd.read_csv(os.path.join(model_folder, "features.csv"))
+
+FEATURE_COLS = [c for c in df.columns if c not in ("class", "image", "label")]
+CLASS_NAMES  = {0: "negative", 1: "EdU+", 2: "PCM1+", 3: "EdU+PCM1+"}
+
+X = df[FEATURE_COLS].values
+y = df["class"].values
+
+print(f"Training on {len(df)} nuclei across {df['image'].nunique()} images")
+print(pd.Series(y).value_counts().sort_index().rename(CLASS_NAMES))
+
+# ── Class weights ──────────────────────────────────────────────────────────────
+classes = np.unique(y)
+weights = compute_class_weight("balanced", classes=classes, y=y)
+cw_dict = dict(zip(classes.tolist(), weights.tolist()))
+print(f"\nClass weights: { {CLASS_NAMES[k]: round(v,2) for k,v in cw_dict.items()} }")
+
+# ── Cross-validation ───────────────────────────────────────────────────────────
+rf = RandomForestClassifier(
+    n_estimators=500,
+    max_depth=None,
+    min_samples_leaf=2,
+    class_weight=cw_dict,
+    random_state=42,
+    n_jobs=-1,
+)
+
+cv     = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+scores = cross_val_score(rf, X, y, cv=cv, scoring="balanced_accuracy")
+print(f"\nCross-val balanced accuracy: {scores.mean():.3f} ± {scores.std():.3f}")
+
+# ── Final fit ──────────────────────────────────────────────────────────────────
+rf.fit(X, y)
+y_pred = rf.predict(X)
+print("\nTraining set report (sanity check):")
+print(classification_report(y, y_pred, target_names=[CLASS_NAMES[i] for i in sorted(CLASS_NAMES)]))
+
+# Confusion matrix
+fig, ax = plt.subplots(figsize=(6, 5))
+ConfusionMatrixDisplay.from_predictions(
+    y, y_pred,
+    display_labels=[CLASS_NAMES[i] for i in sorted(CLASS_NAMES)],
+    ax=ax, colorbar=False
+)
+ax.set_title("Confusion matrix (training set)")
+plt.tight_layout()
+plt.savefig(os.path.join(model_folder, "confusion_matrix.png"), dpi=150)
+plt.show()
+
+# Feature importance
+importances = pd.Series(rf.feature_importances_, index=FEATURE_COLS).sort_values(ascending=True)
+fig, ax = plt.subplots(figsize=(8, 10))
+importances.plot.barh(ax=ax)
+ax.set_title("Feature importances")
+ax.set_xlabel("Mean decrease in impurity")
+plt.tight_layout()
+plt.savefig(os.path.join(model_folder, "feature_importance.png"), dpi=150)
+plt.show()
+
+# ── Save ───────────────────────────────────────────────────────────────────────
+joblib.dump(rf,           os.path.join(model_folder, "rf_model.joblib"))
+joblib.dump(FEATURE_COLS, os.path.join(model_folder, "feature_cols.joblib"))
+print(f"\n✅ Model saved to {model_folder}")
