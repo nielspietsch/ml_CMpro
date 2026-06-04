@@ -1,1 +1,171 @@
+#Script for machine learning analysis of EdU/PCM1 nuclei in EHTs 
 
+import os
+import numpy as np
+import pandas as pd
+import tifffile as tiff
+import joblib
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from glob import glob
+from scipy.ndimage import binary_dilation
+from skimage.measure import regionprops
+from joblib import Parallel, delayed
+
+
+# ── Paths ──────────────────────────────────────────────────────────────────────
+mip_folder    = "/home/niels/MIP_output"
+label_folder  = "/home/niels/Labels"
+model_folder  = "/home/niels/Model"
+output_folder = "/home/niels/Analysis"
+os.makedirs(output_folder, exist_ok=True)
+
+CH_DAPI  = 0
+CH_EDU   = 1
+CH_PCM1  = 2
+DILATION = 5
+PREVIEW  = True
+
+CLASS_MAP = {0: "negative", 1: "EdU+", 2: "PCM1+", 3: "EdU+PCM1+"}
+CLASS_COLOURS = {
+    "negative":  (0.45, 0.45, 0.45),
+    "EdU+":      (0.0,  1.0,  1.0),
+    "PCM1+":     (1.0,  0.0,  1.0),
+    "EdU+PCM1+": (1.0,  1.0,  0.0),
+}
+
+# ── Load model ─────────────────────────────────────────────────────────────────
+rf           = joblib.load(os.path.join(model_folder, "rf_model.joblib"))
+FEATURE_COLS = joblib.load(os.path.join(model_folder, "feature_cols.joblib"))
+print("✅ Model loaded")
+
+# ── Reuse feature extraction from training script ──────────────────────────────
+
+def extract_features(nid, labels, dapi, edu, pcm1, dilation=5):
+    struct       = np.ones((2 * dilation + 1, 2 * dilation + 1), dtype=bool)
+    nucleus_mask = labels == nid
+    dilated_mask = binary_dilation(nucleus_mask, structure=struct)
+    ring_mask    = dilated_mask & ~nucleus_mask
+
+    edu_vals       = edu [nucleus_mask]
+    pcm1_ring_vals = pcm1[ring_mask]  if ring_mask.any() else np.array([0.0])
+    pcm1_nuc_vals  = pcm1[nucleus_mask]
+    dapi_vals      = dapi[nucleus_mask]
+    rp             = regionprops(nucleus_mask.astype(np.uint8))[0]
+
+    return {
+        "edu_mean":               edu_vals.mean(),
+        "edu_median":             np.median(edu_vals),
+        "edu_std":                edu_vals.std(),
+        "edu_max":                edu_vals.max(),
+        "edu_p95":                np.percentile(edu_vals, 95),
+        "pcm1_ring_mean":         pcm1_ring_vals.mean(),
+        "pcm1_ring_median":       np.median(pcm1_ring_vals),
+        "pcm1_ring_std":          pcm1_ring_vals.std(),
+        "pcm1_ring_max":          pcm1_ring_vals.max(),
+        "pcm1_ring_p95":          np.percentile(pcm1_ring_vals, 95),
+        "pcm1_nuc_mean":          pcm1_nuc_vals.mean(),
+        "pcm1_ring_to_nuc_ratio": pcm1_ring_vals.mean() / (pcm1_nuc_vals.mean() + 1e-9),
+        "dapi_mean":              dapi_vals.mean(),
+        "dapi_std":               dapi_vals.std(),
+        "area":                   rp.area,
+        "eccentricity":           rp.eccentricity,
+    }
+
+
+def make_overlay(dapi, labels, df_nuclei):
+    bg  = dapi.astype(np.float32)
+    bg  = (bg - bg.min()) / (bg.max() - bg.min() + 1e-9)
+    rgb = np.stack([bg, bg, bg], axis=-1)
+    for _, row in df_nuclei.iterrows():
+        mask = labels == row["label"]
+        col  = CLASS_COLOURS[row["class_label"]]
+        for c, v in enumerate(col):
+            rgb[..., c][mask] = v
+    return rgb
+
+
+# ── Inference loop ─────────────────────────────────────────────────────────────
+mip_files = sorted(glob(os.path.join(mip_folder, "**", "*_MIP.tif"), recursive=True))
+all_summary = []
+
+for mip_path in mip_files:
+    basename   = os.path.basename(mip_path).replace("_MIP.tif", "")
+    label_matches = glob(os.path.join(label_folder, "**", basename + "_labels.tif"), recursive=True)
+    if not label_matches:
+        print(f"⚠️  No label file for {basename}, skipping.")
+        continue
+    label_path = label_matches[0]
+
+    if not os.path.exists(label_path):
+        print(f"⚠️  No label file for {basename}, skipping.")
+        continue
+
+    print(f"Predicting: {basename}")
+    mip    = tiff.imread(mip_path).astype(np.float32)
+    labels = tiff.imread(label_path)
+    dapi   = mip[CH_DAPI]; edu = mip[CH_EDU]; pcm1 = mip[CH_PCM1]
+
+    nucleus_ids = np.unique(labels)
+    nucleus_ids = nucleus_ids[nucleus_ids > 0]
+
+    def process_nucleus(nid):
+        feats = extract_features(nid, labels, dapi, edu, pcm1, DILATION)
+        yx    = np.argwhere(labels == nid).mean(axis=0)
+        feats.update({"label": nid, "centroid_y": yx[0], "centroid_x": yx[1]})
+        return feats
+
+    rows = Parallel(n_jobs=-1)(delayed(process_nucleus)(nid) for nid in nucleus_ids)
+
+    df = pd.DataFrame(rows)
+    X  = df[FEATURE_COLS].values
+
+    df["class"]       = rf.predict(X)
+    df["class_label"] = df["class"].map(CLASS_MAP)
+    df["confidence"]  = rf.predict_proba(X).max(axis=1)
+    df["image"]       = basename
+
+    # Per-nucleus CSV
+    csv_path = os.path.join(output_folder, basename + "_nuclei.csv")
+    df.to_csv(csv_path, index=False)
+
+    # Summary
+    total  = len(df)
+    counts = df["class_label"].value_counts()
+    summary = {
+        "image":         basename,
+        "total_nuclei":  total,
+        "n_negative":    counts.get("negative",  0),
+        "n_EdU+":        counts.get("EdU+",       0),
+        "n_PCM1+":       counts.get("PCM1+",      0),
+        "n_EdU+PCM1+":   counts.get("EdU+PCM1+",  0),
+        "pct_EdU+":      round(counts.get("EdU+",       0) / total * 100, 2),
+        "pct_PCM1+":     round(counts.get("PCM1+",      0) / total * 100, 2),
+        "pct_EdU+PCM1+": round(counts.get("EdU+PCM1+",  0) / total * 100, 2),
+    }
+    all_summary.append(summary)
+    print(f"  {total} nuclei | EdU+: {summary['n_EdU+']} | "
+          f"PCM1+: {summary['n_PCM1+']} | Double+: {summary['n_EdU+PCM1+']}")
+
+    # Overlay
+    rgb = make_overlay(dapi, labels, df)
+    fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+    axes[0].imshow(dapi, cmap="Blues_r");  axes[0].set_title("DAPI");  axes[0].axis("off")
+    axes[1].imshow(edu,  cmap="Greens_r"); axes[1].set_title("EdU");   axes[1].axis("off")
+    axes[2].imshow(pcm1, cmap="Reds_r");   axes[2].set_title("PCM1");  axes[2].axis("off")
+    axes[3].imshow(rgb);                   axes[3].set_title(f"RF Classification (n={total})"); axes[3].axis("off")
+    patches = [mpatches.Patch(color=CLASS_COLOURS[k], label=k) for k in CLASS_COLOURS]
+    axes[3].legend(handles=patches, loc="lower right", fontsize=8, framealpha=0.7)
+    plt.suptitle(basename, fontsize=11, y=1.01)
+    plt.tight_layout()
+    png_path = os.path.join(output_folder, basename + "_overlay.png")
+    plt.savefig(png_path, dpi=150, bbox_inches="tight")
+    if PREVIEW:
+        plt.show()
+    plt.close()
+
+# Summary CSV
+summary_df = pd.DataFrame(all_summary)
+summary_df.to_csv(os.path.join(output_folder, "summary_all_images.csv"), index=False)
+print("\n✅ Inference complete.")
+print(summary_df.to_string(index=False))
